@@ -140,6 +140,17 @@ func (c *connection) clientHandshake(dialAddress string, config *ClientConfig) e
 
 	c.sessionID = c.transport.getSessionID()
 	c.algorithms = c.transport.getAlgorithms()
+
+	if config.TransportReadyCallback != nil {
+		ctx := &ClientTransportReadyContext{
+			Metadata:   c,
+			Algorithms: c.algorithms,
+		}
+		if err := config.TransportReadyCallback(ctx); err != nil {
+			return err
+		}
+	}
+
 	return c.clientAuthenticate(config)
 }
 
@@ -221,6 +232,27 @@ func Dial(network, addr string, config *ClientConfig) (*Client, error) {
 // or NewClientConn. The remote address is the RemoteAddr of the
 // net.Conn underlying the SSH connection.
 type HostKeyCallback func(hostname string, remote net.Addr, key PublicKey) error
+
+// ClientTransportReadyContext contains information about the established
+// transport layer, passed to [ClientTransportReadyCallback].
+type ClientTransportReadyContext struct {
+	// Metadata contains the connection metadata.
+	Metadata ConnMetadata
+
+	// Algorithms contains the negotiated algorithms.
+	Algorithms NegotiatedAlgorithms
+}
+
+// ClientTransportReadyCallback is a hook invoked once the SSH transport layer
+// handshake (RFC 4253) has completed successfully, including version
+// exchange, algorithm negotiation, key exchange, and server host key
+// verification, but before user authentication (RFC 4252) begins.
+//
+// The callback is invoked once per connection and is not invoked again on
+// subsequent key exchanges. Returning a non-nil error aborts the connection
+// before any authentication message is sent, causing the SSH handshake to
+// fail with the provided error.
+type ClientTransportReadyCallback func(ctx *ClientTransportReadyContext) error
 
 // BannerCallback is the function type used for treat the banner sent by
 // the server. A BannerCallback receives the message sent by the remote server.
@@ -328,6 +360,11 @@ type ClientConfig struct {
 
 	// AuthCallback, if non-nil, is invoked before each authentication attempt.
 	AuthCallback ClientAuthCallback
+
+	// TransportReadyCallback, if non-nil, is invoked once the transport layer
+	// is established and before user authentication begins. See
+	// [ClientTransportReadyCallback].
+	TransportReadyCallback ClientTransportReadyCallback
 }
 
 // InsecureIgnoreHostKey returns a function that can be used for
