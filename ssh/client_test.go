@@ -12,7 +12,9 @@ import (
 	"net"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestClientVersion(t *testing.T) {
@@ -520,5 +522,132 @@ func TestCBCCiphers(t *testing.T) {
 				t.Errorf("unexpected error %v", err)
 			}
 		})
+	}
+}
+
+func TestTransportReadyCallback(t *testing.T) {
+	var events []string
+	var got *ClientTransportReadyContext
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			PasswordCallback(func() (string, error) {
+				events = append(events, "auth")
+				return clientPassword, nil
+			}),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+		TransportReadyCallback: func(ctx *ClientTransportReadyContext) error {
+			events = append(events, "transport ready")
+			got = ctx
+			return nil
+		},
+	}
+
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+	if want := []string{"transport ready", "auth"}; !slices.Equal(events, want) {
+		t.Fatalf("got events %q, want %q", events, want)
+	}
+	if len(got.Metadata.SessionID()) == 0 {
+		t.Error("empty session ID")
+	}
+	if v := string(got.Metadata.ServerVersion()); v != packageVersion {
+		t.Errorf("got server version %q, want %q", v, packageVersion)
+	}
+	if got.Algorithms.KeyExchange == "" || got.Algorithms.HostKey == "" ||
+		got.Algorithms.Read.Cipher == "" || got.Algorithms.Write.Cipher == "" {
+		t.Errorf("incomplete negotiated algorithms: %+v", got.Algorithms)
+	}
+}
+
+func TestTransportReadyCallbackError(t *testing.T) {
+	errTransportReady := errors.New("transport ready callback error")
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			Password(clientPassword),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+		TransportReadyCallback: func(ctx *ClientTransportReadyContext) error {
+			return errTransportReady
+		},
+	}
+
+	err, serverAuthErrors := tryAuthBothSides(t, config, nil)
+	if !errors.Is(err, errTransportReady) {
+		t.Fatalf("got error %v, want %v", err, errTransportReady)
+	}
+	if len(serverAuthErrors) != 0 {
+		t.Errorf("server saw %d authentication attempts, want 0", len(serverAuthErrors))
+	}
+}
+
+func TestTransportReadyCallbackNotCalledOnRekey(t *testing.T) {
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+
+	serverConfig := &ServerConfig{
+		NoClientAuth: true,
+	}
+	serverConfig.AddHostKey(testSigners["rsa"])
+	go func() {
+		_, chans, reqs, err := NewServerConn(c1, serverConfig)
+		if err != nil {
+			return
+		}
+		go DiscardRequests(reqs)
+		for newCh := range chans {
+			newCh.Reject(UnknownChannelType, "unknown channel type")
+		}
+	}()
+
+	// HostKeyCallback runs on every key exchange, so it signals when the
+	// rekey below has completed.
+	kexDone := make(chan struct{}, 2)
+	var calls atomic.Int32
+	config := &ClientConfig{
+		User: "testuser",
+		HostKeyCallback: func(hostname string, remote net.Addr, key PublicKey) error {
+			kexDone <- struct{}{}
+			return nil
+		},
+		TransportReadyCallback: func(ctx *ClientTransportReadyContext) error {
+			calls.Add(1)
+			return nil
+		},
+	}
+	conn, chans, reqs, err := NewClientConn(c2, "", config)
+	if err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+	defer conn.Close()
+	go DiscardRequests(reqs)
+	go func() {
+		for newCh := range chans {
+			newCh.Reject(UnknownChannelType, "unknown channel type")
+		}
+	}()
+	<-kexDone
+
+	conn.(*connection).transport.(*handshakeTransport).requestKeyExchange()
+	select {
+	case <-kexDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for key re-exchange")
+	}
+	// Writes are held back until the key exchange finishes, so a round trip
+	// guarantees the rekey is complete.
+	if _, _, err := conn.SendRequest("ping", true, nil); err != nil {
+		t.Fatalf("SendRequest: %v", err)
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("TransportReadyCallback called %d times, want 1", n)
 	}
 }
