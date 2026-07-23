@@ -137,6 +137,13 @@ func (c *connection) clientHandshake(dialAddress string, config *ClientConfig) e
 
 	c.sessionID = c.transport.getSessionID()
 	c.algorithms = c.transport.getAlgorithms()
+
+	if config.TransportReadyCallback != nil {
+		if err := config.TransportReadyCallback(c, c.algorithms); err != nil {
+			return err
+		}
+	}
+
 	return c.clientAuthenticate(config)
 }
 
@@ -325,6 +332,14 @@ type ClientConfig struct {
 
 	// AuthCallback, if non-nil, is invoked before each authentication attempt.
 	AuthCallback ClientAuthCallback
+
+	// TransportReadyCallback, if non-nil, is called once the SSH transport layer
+	// handshake (RFC 4253) has completed successfully (version exchange,
+	// algorithm negotiation, key exchange, and server host key verification),
+	// but before user authentication (RFC 4252) begins. It is not called again
+	// on subsequent rekeys. Returning a non-nil error aborts the connection
+	// before any authentication method is attempted.
+	TransportReadyCallback func(ConnMetadata, NegotiatedAlgorithms) error
 }
 
 // InsecureIgnoreHostKey returns a function that can be used for
